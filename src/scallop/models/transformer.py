@@ -62,34 +62,64 @@ def fwht_torch(x: torch.Tensor) -> torch.Tensor:
 # -------------------- Rotary Position Encoding (RoPE) --------------------
 def apply_rope(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply Rotary Position Encoding (RoPE) to Q and K.
+    Apply Rotary Position Encoding (RoPE) to Q and K, but SKIP the first token
+    (assumed to be a special condition token) so it does not receive RoPE.
+
     Args:
-        q: (C,H,L,D)
-        k: (C,H,L,D)
+        q: (C, H, L, D)
+        k: (C, H, L, D)
     Returns:
-        q_rot, k_rot: (C,H,L,D)
+        q_rot, k_rot: (C, H, L, D)
     """
     C, H, L, D = q.shape
-    q1, q2 = q[..., ::2], q[..., 1::2]
-    k1, k2 = k[..., ::2], k[..., 1::2]
+    if L <= 1:
+        # nothing to do (only condition token present)
+        return q, k
 
     device = q.device
-    theta = 10000 ** (-torch.arange(0, D, 2, device=device) / D)  # (D/2,)
-    pos = torch.arange(L, device=device).unsqueeze(1)  # (L,1)
-    angle = pos * theta  # (L, D/2)
+    dtype = q.dtype
 
-    cos = angle.cos()[None, None, :, :]  # (1,1,L,D/2)
-    sin = angle.sin()[None, None, :, :]  # (1,1,L,D/2)
+    # Work on tokens 1..L-1 (these are the real sequence tokens)
+    q_rot = q.clone()
+    k_rot = k.clone()
 
-    # q_rotated
-    q_rot = torch.zeros_like(q)
-    k_rot = torch.zeros_like(k)
+    # slice out the subsequence to apply RoPE to: shape (C,H,L-1,D)
+    q_sub = q[..., 1:, :].to(dtype)
+    k_sub = k[..., 1:, :].to(dtype)
 
-    q_rot[..., ::2] = q1 * cos - q2 * sin
-    q_rot[..., 1::2] = q1 * sin + q2 * cos
+    # split even/odd dims
+    q1, q2 = q_sub[..., ::2], q_sub[..., 1::2]  # (..., D/2)
+    k1, k2 = k_sub[..., ::2], k_sub[..., 1::2]
 
-    k_rot[..., ::2] = k1 * cos - k2 * sin
-    k_rot[..., 1::2] = k1 * sin + k2 * cos
+    # frequencies: shape (D/2,)
+    freqs = 10000 ** (-torch.arange(0, D, 2, device=device, dtype=dtype) / D)
+
+    # positions for the subsequence start at 0 .. L-2 (so token at index 1 gets pos 0)
+    pos = torch.arange(0, L - 1, device=device, dtype=dtype).unsqueeze(1)  # (L-1, 1)
+    angle = pos * freqs  # (L-1, D/2)
+
+    # expand to (1,1,L-1,D/2) to broadcast over C,H
+    cos = angle.cos()[None, None, :, :]  # (1,1,L-1,D/2)
+    sin = angle.sin()[None, None, :, :]  # (1,1,L-1,D/2)
+
+    # apply rotation to subsequence
+    q_sub_even = q1 * cos - q2 * sin
+    q_sub_odd  = q1 * sin + q2 * cos
+    k_sub_even = k1 * cos - k2 * sin
+    k_sub_odd  = k1 * sin + k2 * cos
+
+    # interleave even/odd back to (..., D)
+    q_sub_rot = torch.empty_like(q_sub)
+    q_sub_rot[..., ::2] = q_sub_even
+    q_sub_rot[..., 1::2] = q_sub_odd
+
+    k_sub_rot = torch.empty_like(k_sub)
+    k_sub_rot[..., ::2] = k_sub_even
+    k_sub_rot[..., 1::2] = k_sub_odd
+
+    # assign rotated subsequence back, leaving index 0 unchanged
+    q_rot[..., 1:, :] = q_sub_rot
+    k_rot[..., 1:, :] = k_sub_rot
 
     return q_rot, k_rot
 
