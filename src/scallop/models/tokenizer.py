@@ -94,6 +94,17 @@ class Tokenizer(nn.Module):
         self.register_buffer('bin_idx', torch.arange(num_bins, dtype=torch.long))
         self.register_buffer('gene_idx', torch.arange(num_genes, dtype=torch.long))
 
+        # initialize this module and all submodules
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def _expr_mapping(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Map expression values (C, G) to expression embeddings (C, G, E).

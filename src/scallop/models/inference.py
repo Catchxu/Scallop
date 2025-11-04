@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from .transformer import Transformer
+from .component import RMSNorm, SwiGLU
 
 
 class GumbelTopK(nn.Module):
@@ -222,6 +223,15 @@ class InferenceModel(nn.Module):
         self.backbone = Transformer(embed_dim, num_layers, num_heads, **kwargs)
         self.tfrouter = Router(embed_dim, num_factors, topk=topk, tau=tau)
         self.tgrouter = Router(embed_dim, num_factors, topk=topk, tau=tau)
+
+        # apply initialization recursively to all submodules
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
     
     def forward(
         self,

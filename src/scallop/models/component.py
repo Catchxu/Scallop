@@ -19,7 +19,12 @@ class SwiGLU(nn.Module):
         super().__init__()
         self.w1 = nn.Linear(dim_in, dim_hidden)
         self.w2 = nn.Linear(dim_in, dim_hidden)
-        self.w3 = nn.Linear(dim_hidden, dim_in)
+        
+        self.proj_weight = nn.Parameter(torch.zeros(dim_in, dim_hidden))  # (out, in)
+        self.proj_bias = nn.Parameter(torch.zeros(dim_in))
+
+        nn.init.normal_(self.proj_weight, mean=0.0, std=1e-6)
 
     def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+        hidden = F.silu(self.w1(x)) * self.w2(x)
+        return hidden @ self.proj_weight.T + self.proj_bias
