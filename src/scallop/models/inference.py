@@ -105,8 +105,8 @@ class Router(nn.Module):
         num_factors: int, 
         hidden_dim: int = 128, 
         dropout: float = 0.1,
-        topk: int = None,   # if specified, apply Top-K selection
-        tau: float = 1.0,   # temperature for GumbelTopK
+        topk: Optional[int] = None,   # if specified, apply Top-K selection
+        tau: float = 1.0   # temperature for GumbelTopK
     ):
         """
         Args:
@@ -198,57 +198,118 @@ class Router(nn.Module):
         return probs
 
 
-# class InferenceModel(nn.Module):
-#     def __init__(
-#         self,
-#         embed_dim: int,
-#         num_layers: int = 4,
-#         num_heads: int = 8,
-#         num_factors: int = 128, 
-#     ):
-#         super().__init__()
+class InferenceModel(nn.Module):
+    """
+    Inference model for single-cell gene allocation.
+
+    - Backbone: Transformer over token embeddings
+    - Two Routers: TF-router and TG-router mapping gene tokens to factor assignments
+    - Final allocation: outer product of TF and TG allocations
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        num_factors: int = 256,
+        topk: Optional[int] = 32,
+        tau: float = 1.0,
+        **kwargs
+    ):
+        super().__init__()
+        self.backbone = Transformer(embed_dim, num_layers, num_heads, **kwargs)
+        self.tfrouter = Router(embed_dim, num_factors, topk=topk, tau=tau)
+        self.tgrouter = Router(embed_dim, num_factors, topk=topk, tau=tau)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        tf_idx: Optional[torch.Tensor] = None,
+        tg_idx: Optional[torch.Tensor] = None,
+        mask_expr: Optional[torch.Tensor] = None,
+        **kwargs
+    ):
+        """
+        Args:
+            x: FloatTensor (C, L, E), token embeddings including condition + genes
+            tf_idx: LongTensor (S_TF,), indices of TF genes to route
+            tg_idx: LongTensor (S_TG,), indices of TG genes to route
+            mask_expr: BoolTensor (C, L), True=valid token, False=masked
+            **kwargs: extra arguments (e.g., temperature) for Routers
+
+        Returns:
+            allocation: FloatTensor (C, S_TF, S_TG), outer product of TF/TG allocations
+                        Already incorporates TF/TG masks internally; no extra masking needed.
+        """
+        # Pass through transformer backbone
+        tokens = self.backbone(x)  # (C, L, E)
+
+        # TF allocation
+        tf_allocation = self.tfrouter(tokens, gene_idx=tf_idx, mask_expr=mask_expr, **kwargs)  # (C, S_TF, m)
+
+        # TG allocation
+        tg_allocation = self.tgrouter(tokens, gene_idx=tg_idx, mask_expr=mask_expr, **kwargs)  # (C, S_TG, m)
+
+        # Final allocation: outer product over latent factors
+        # shape: (C, S_TF, S_TG)
+        allocation = torch.einsum('cfm,cgm->cfg', tf_allocation, tg_allocation)
+
+        return allocation
+
 
 
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-
-    # ---------- Hyperparameters ----------
-    C = 2           # batch size
-    G = 8           # number of genes
-    E = 16          # embedding dim
-    m = 5           # number of latent factors
-    hidden_dim = 32
+    # -----------------------------
+    # Configuration
+    # -----------------------------
+    batch_size = 4
+    num_genes = 10           # G
+    embed_dim = 16           # E
+    num_factors = 8          # m
+    num_layers = 2
+    num_heads = 4
     topk = 3
-    tau = 0.5
+    tau = 1.0
 
-    # ---------- Create random tokens ----------
-    # tokens: (C, L=G+1, E), first token = condition
-    tokens = torch.randn(C, G + 1, E)
+    # Randomly select some TF and TG gene indices
+    tf_idx = torch.tensor([0, 2, 5], dtype=torch.long)
+    tg_idx = torch.tensor([1, 3, 5, 7], dtype=torch.long)
 
-    # Random gene_idx selection (e.g., select all genes)
-    gene_idx = torch.arange(G)
+    # -----------------------------
+    # Create random embeddings and mask
+    # -----------------------------
+    # Include condition token, so L = 1 + G
+    L = 1 + num_genes
+    tokens = torch.randn(batch_size, L, embed_dim)
 
-    # Random mask_expr (C, L), True = expressed, False = zero-expression
-    mask_expr = torch.ones(C, G + 1, dtype=torch.bool)
-    mask_expr[0, [2, 5]] = False  # example: mask out gene 2 and 5 in batch 0
-    mask_expr[1, [3]] = False     # mask out gene 3 in batch 1
+    # Random mask: True = valid gene, False = zero-expression gene
+    mask_expr = torch.randint(0, 2, (batch_size, L), dtype=torch.bool)
+    # Ensure first token (condition) is always valid
+    mask_expr[:, 0] = True
 
-    # ---------- Instantiate Router ----------
-    router = Router(embed_dim=E, num_factors=m, hidden_dim=hidden_dim, dropout=0.1, topk=topk, tau=tau)
+    # -----------------------------
+    # Instantiate model
+    # -----------------------------
+    model = InferenceModel(
+        embed_dim=embed_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        num_factors=num_factors,
+        topk=topk,
+        tau=tau
+    )
 
-    # ---------- TRAINING MODE (soft Gumbel-TopK) ----------
-    router.train()
-    probs_train = router(tokens, gene_idx=gene_idx, mask_expr=mask_expr)
-    print("Training mode (soft Top-K) probabilities:")
-    print(probs_train)
-    print("Shape:", probs_train.shape)
-    print("Sum over factors (should < 1 for masked genes):", probs_train.sum(dim=-1))
+    # -----------------------------
+    # Forward pass
+    # -----------------------------
+    allocation = model(tokens, tf_idx=tf_idx, tg_idx=tg_idx, mask_expr=mask_expr)
 
-    # ---------- EVAL MODE (hard Top-K) ----------
-    router.eval()
-    probs_eval = router(tokens, gene_idx=gene_idx, mask_expr=mask_expr)
-    print("\nEvaluation mode (hard Top-K) probabilities:")
-    print(probs_eval)
-    print("Shape:", probs_eval.shape)
-    print("Sum over factors (masked genes should be 0):", probs_eval.sum(dim=-1))
+    # -----------------------------
+    # Print shapes and stats
+    # -----------------------------
+    print("Tokens shape:", tokens.shape)
+    print("Mask shape:", mask_expr.shape)
+    print("TF indices:", tf_idx)
+    print("TG indices:", tg_idx)
+    print("Allocation shape:", allocation.shape)  # Expected: (batch_size, len(tf_idx), len(tg_idx))

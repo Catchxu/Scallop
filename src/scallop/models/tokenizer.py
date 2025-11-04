@@ -114,7 +114,7 @@ class Tokenizer(nn.Module):
 
         Returns:
             out: FloatTensor of shape (C, G+1, E)
-            mask_expr: FloatTensor of shape (C, G+1)
+            mask_expr: BoolTensor of shape (C, G+1)
                 - mask_expr[:, 0] = 0 (condition token)
                 - mask_expr[:, 1:] = 1 if expr != 0 else 0
         """
