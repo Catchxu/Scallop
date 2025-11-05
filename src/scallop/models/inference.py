@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from typing import Optional
 
 from .transformer import Transformer
-from .component import RMSNorm, SwiGLU
 
 
 class GumbelTopK(nn.Module):
@@ -266,6 +265,69 @@ class InferenceModel(nn.Module):
         allocation = torch.einsum('cfm,cgm->cfg', tf_allocation, tg_allocation)
 
         return allocation
+
+    def init_celltype_grn(self, num_celltypes: int, num_TFs: int, num_TGs: int):
+        self.CT = num_celltypes
+        self.S_TF = num_TFs
+        self.S_TG = num_TGs
+        self.mode = "celltype"
+
+        device = next(self.parameters()).device
+        self.celltype_A_sum = torch.zeros(self.CT, self.S_TF, self.S_TG, device=device)
+        self.celltype_counts = torch.zeros(self.CT, 1, 1, device=device)
+
+    def init_general_grn(self, num_TFs: int, num_TGs: int):
+        self.S_TF = num_TFs
+        self.S_TG = num_TGs
+        self.mode = "general"
+
+        device = next(self.parameters()).device
+        self.general_A_sum = torch.zeros(self.S_TF, self.S_TG, device=device)
+        self.general_counts = 0
+
+    def accumulate_batch_grn(self, batch_A: torch.Tensor, batch_celltype_idx: Optional[torch.Tensor]=None):
+        """
+        Accumulate batch GRN information.
+
+        Parameters:
+        batch_A: Tensor of shape (batch_size, S_TF, S_TG)
+        batch_celltype_idx: Optional tensor of shape (batch_size,). Used only in celltype mode.
+        """
+        if self.mode == "celltype":
+            if batch_celltype_idx is None:
+                raise ValueError("batch_celltype_idx is required in celltype mode.")
+            self.celltype_A_sum.index_add_(0, batch_celltype_idx, batch_A)
+            device = next(self.parameters()).device
+            ones = torch.ones((batch_A.size(0), 1, 1), device=device)
+            self.celltype_counts.index_add_(0, batch_celltype_idx, ones)
+
+        elif self.mode == "general":
+            self.general_A_sum += batch_A.sum(dim=0)
+            self.general_counts += batch_A.size(0)
+
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    def get_celltype_grn(self):
+        """
+        Get the average GRN for each celltype.
+        """
+        if self.mode != "celltype":
+            raise ValueError("Please enable celltype mode first.")
+        # Avoid division by zero by using torch.where
+        counts = self.celltype_counts
+        counts = torch.where(counts == 0, torch.ones_like(counts), counts)
+        return self.celltype_A_sum / counts
+
+    def get_general_grn(self):
+        """
+        Get the average general GRN.
+        """
+        if self.mode != "general":
+            raise ValueError("Please enable general mode first.")
+        if self.general_counts == 0:
+            return torch.zeros_like(self.general_A_sum)
+        return self.general_A_sum / self.general_counts
 
 
 
