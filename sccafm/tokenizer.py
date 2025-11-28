@@ -1,18 +1,20 @@
 import torch
+
 import numpy as np
 import pandas as pd
+import scanpy as sc
 
 
 class GeneTokenizer:
     """
     Gene tokenizer: Convert gene names into token indices.
-    Output shape: (C, L)
+    Output shape: (C, L-1)
     """
     def __init__(self, token_dict: pd.DataFrame, pad_token="<pad>", max_length=4096):
         """
         token_dict: DataFrame with columns: token_index, gene_symbol, gene_id
         """
-        self.max_length = max_length
+        self.max_length = max_length - 1  # remain one position for cond+batch
 
         # pad token index
         pad_row = token_dict[token_dict["gene_id"] == pad_token]
@@ -26,10 +28,11 @@ class GeneTokenizer:
 
     def __call__(self, adata, gene_key=None, order_matrix=None):
         """
-        adata: AnnData, shape (C, G)
-        gene_key: if not None, fetch gene names from adata.var[gene_key]
-        order_matrix: CxG matrix giving order per cell. If provided,
-                      rearrange gene names in each row accordingly.
+        Args:
+            adata: AnnData, shape (C, G)
+            gene_key: if not None, fetch gene names from adata.var[gene_key]
+            order_matrix: (C, G) matrix giving order per cell. If provided, 
+                rearrange gene names in each row accordingly.
         """
         # ---- 1. Get gene names ----
         if gene_key is None:
@@ -76,11 +79,11 @@ class GeneTokenizer:
 
 class ExprTokenizer:
     """
-    Expression tokenizer: convert adata.X (CxG) into padded matrix.
-    Output shape: (C, L), pad filled with 0.
+    Expression tokenizer: convert adata.X (C, G) into padded matrix.
+    Output shape: (C, L-1), pad filled with 0.
     """
     def __init__(self, max_length=4096):
-        self.max_length = max_length
+        self.max_length = max_length - 1  # remain one position for cond+batch
 
     def __call__(self, adata, order_matrix=None):
         X = adata.X  # C×G
@@ -115,12 +118,12 @@ class CondTokenizer:
     """
     Condition tokenizer:
     Inputs: adata + obs keys: platform_key, species_key, tissue_key, disease_key
-    Output: Cx4 tensor (4 condition tokens per cell)
+    Output: (C, 4) tensor (4 condition tokens per cell)
     """
     def __init__(self, cond_dict=None, simplify=False):
         """
         cond_dict: DataFrame with columns: cond_value, token_index
-        simplify: if True → always return 0 token for all 4 features
+        simplify: if True -> always return 0 token for all 4 features
         """
         self.simplify = simplify
 
@@ -147,7 +150,7 @@ class CondTokenizer:
         """
         value = str(value).lower()
 
-        # missing or nan → return 0 token
+        # missing or nan -> return 0 token
         if value == "nan":
             return 0
 
@@ -171,9 +174,6 @@ class CondTokenizer:
             tissue_key=None, 
             disease_key=None
     ):
-        """
-        Return: Cx4 tensor
-        """
         C = adata.n_obs
 
         # If simplify mode: return all zero tokens
@@ -187,7 +187,7 @@ class CondTokenizer:
 
         for key in keys:
             if key is None or key not in obs:
-                # missing key → use pad (0)
+                # missing key -> use pad (0)
                 cond_values.append(["nan"] * C)
             else:
                 cond_values.append(obs[key].astype(str).tolist())
@@ -206,7 +206,7 @@ class CondTokenizer:
 class BatchTokenizer:
     """
     Assign a unique batch ID (integer counter) per adata input.
-    Output: Cx1 tensor filled with batch index.
+    Output: (C, 1) tensor filled with batch index.
     """
     def __init__(self, simplify=False):
         self.counter = 0
@@ -227,91 +227,122 @@ class BatchTokenizer:
         return torch.tensor(out)
 
 
+class TomeTokenizer:
+    """
+    Unified Transcriptome Tokenizer:
+    Internally manages GeneTokenizer, ExprTokenizer, CondTokenizer, BatchTokenizer.
+    """
+    def __init__(
+            self,
+            token_dict,           # token dictionary DataFrame for GeneTokenizer
+            max_length=4096,      # max length for gene/expression sequences
+            cond_dict=None,       # optional pre-existing cond_dict DataFrame
+            simplify=False        # if True -> cond and batch tokens simplified
+    ):
+        self.gene_tokenizer = GeneTokenizer(token_dict, max_length=max_length)
+        self.expr_tokenizer = ExprTokenizer(max_length=max_length)
+        self.cond_tokenizer = CondTokenizer(cond_dict=cond_dict, simplify=simplify)
+        self.batch_tokenizer = BatchTokenizer(simplify=simplify)
+
+    def _check_pad_consistency(self, gene_pad: torch.Tensor, expr_pad: torch.Tensor):
+        """
+        Check if gene_pad and expr_pad are identical.
+        """
+        if not torch.equal(gene_pad, expr_pad):
+            diff_idx = torch.nonzero(gene_pad != expr_pad)
+            raise ValueError(
+                f"gene_pad and expr_pad are not identical! "
+                f"First differences at indices: {diff_idx[:10]}"
+            )
+    
+    def _preprocess(
+            self, 
+            adata, 
+            min_genes_per_cell=200, 
+            min_cells_per_gene=3,
+            log_norm=True, 
+            n_top_genes=3000
+    ):
+        adata = adata.copy()
+
+        if min_genes_per_cell:
+            sc.pp.filter_cells(adata, min_genes=min_genes_per_cell)
+        
+        if min_cells_per_gene:
+            sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
+
+        if log_norm:
+            sc.pp.normalize_total(adata, target_sum=1e4)
+            sc.pp.log1p(adata)
+
+        if n_top_genes:
+            sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes, subset=True)
+        
+        return adata
+
+    def __call__(
+            self,
+            adata,
+            gene_key=None,
+            order_matrix=None,
+            platform_key=None,
+            species_key=None,
+            tissue_key=None,
+            disease_key=None,
+            preprocess=True,
+            **kwargs
+    ):
+        """
+        Tokenize adata and return a dict of tensors.
+        Output shapes:
+            gene: (C, L-1)
+            expr: (C, L-1)
+            cond: (C, 4)
+            batch: (C, 1)
+            pad: (C, L-1)
+        """
+        if preprocess:
+            self._preprocess(adata, **kwargs)
+
+        gene_tokens, gene_pad = self.gene_tokenizer(
+            adata,
+            gene_key=gene_key,
+            order_matrix=order_matrix
+        )
+
+        expr_tokens, expr_pad = self.expr_tokenizer(
+            adata,
+            order_matrix=order_matrix
+        )
+
+        cond_tokens = self.cond_tokenizer(
+            adata,
+            platform_key=platform_key,
+            species_key=species_key,
+            tissue_key=tissue_key,
+            disease_key=disease_key,
+        )
+
+        batch_tokens = self.batch_tokenizer(adata)
+
+        self._check_pad_consistency(gene_pad, expr_pad)
+
+        return {
+            "gene": gene_tokens,
+            "expr": expr_tokens,
+            "cond": cond_tokens,
+            "batch": batch_tokens,
+            "pad": gene_pad
+        }
+
+
 
 
 if __name__ == "__main__":
     import scanpy as sc
-    import pandas as pd
-    import torch
 
-    print("Loading data...")
     adata = sc.read_h5ad("/data1021/xukaichen/data/DRP/cell_line.h5ad")
     token_dict = pd.read_csv("./resources/token_dict.csv")
 
-    gene_tokenizer = GeneTokenizer(token_dict)
-    expr_tokenizer = ExprTokenizer()
-
-    print("Tokenizing genes...")
-    gene_tokens, gene_pad = gene_tokenizer(adata)
-
-    print("Tokenizing expression...")
-    expr_tokens, expr_pad = expr_tokenizer(adata)
-
-    # ============================================================
-    # =============== Basic Shape Checks ==========================
-    # ============================================================
-    C, G = adata.X.shape
-    L = gene_tokens.shape[1]
-
-    print(f"Cells: {C}, Genes: {G}, Max Length: {L}")
-
-    assert gene_tokens.shape == (C, L), "gene_tokens shape mismatch"
-    assert expr_tokens.shape == (C, L), "expr_tokens shape mismatch"
-    assert gene_pad.shape == (C, L), "gene_pad shape mismatch"
-    assert expr_pad.shape == (C, L), "expr_pad shape mismatch"
-
-    print("✔ Shape checks passed")
-
-    # ============================================================
-    # =============== Pad Mask Consistency Check =================
-    # ============================================================
-    # GeneTokenizer uses True for padding
-    # ExprTokenizer also uses True
-    # Therefore both pad masks must be identical
-    # ============================================================
-
-    same_pad = torch.equal(gene_pad, expr_pad)
-
-    if same_pad:
-        print("✔ gene_pad and expr_pad are IDENTICAL")
-    else:
-        print("❌ gene_pad and expr_pad differ!")
-        # locate difference
-        diff = (gene_pad != expr_pad)
-        idx = torch.nonzero(diff)
-        print(f"   Difference found at positions: {idx[:10]}")
-        raise ValueError("pad mask mismatch")
-
-    # ============================================================
-    # =============== Gene Padding Sanity Check ==================
-    # ============================================================
-    # gene_pad[:, :G] must be False
-    # gene_pad[:, G:] must be True
-    # ============================================================
-
-    assert not gene_pad[:, :G].any(), "Front G region should NOT be padded for genes"
-    assert gene_pad[:, G:].all(), "Back region must be padded for genes"
-
-    print("✔ Gene padding mask sanity checks passed")
-
-    # ============================================================
-    # =============== Expression Padding Sanity Check ============
-    # ============================================================
-    # expr_pad[:, :G] must be False
-    # expr_pad[:, G:] must be True
-    # Zero padding check for expr_tokens
-    # ============================================================
-
-    assert not expr_pad[:, :G].any(), "Front G region should NOT be padded for expr"
-    assert expr_pad[:, G:].all(), "Back region must be padded for expr"
-
-    # Check zeros in padded expr region
-    assert torch.all(expr_tokens[:, G:] == 0), "padded expression must be 0"
-
-    print("✔ Expression padding and zero-fill checks passed")
-
-    # ============================================================
-    # =============== Gene and Expression pad alignment ==========
-    # ============================================================
-    print("FINAL CHECK: pad masks fully aligned ✔\nAll tests passed!\n")
-    
+    tokenizer = TomeTokenizer(token_dict, simplify=True)
+    tokens = tokenizer(adata)
