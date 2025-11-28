@@ -35,20 +35,35 @@ class FlashMHA(nn.Module):
 
     def apply_rotary_pos_emb(self, q, k):
         """
-        Apply rotary positional embedding to query and key
+        Apply rotary positional embedding to query and key.
         q, k: (C, num_heads, L, head_dim)
+        Returns rotated q, k with same shape.
         """
+        # ensure head_dim is even
+        assert (self.head_dim % 2) == 0, "head_dim must be even for rotary"
+        half_dim = self.head_dim // 2
+
         L = q.shape[2]
-        freqs = torch.einsum("i,j -> ij", torch.arange(L, device=q.device), self.inv_freq)  # (L, head_dim/2)
-        # cos/sin embeddings
-        cos = freqs.cos()[None, None, :, :].repeat(1, 1, 1, 2)  # broadcast to (1,1,L,head_dim)
-        sin = freqs.sin()[None, None, :, :].repeat(1, 1, 1, 2)
-        # split even/odd
+        device = q.device
+        # freqs: (L, half_dim)
+        freqs = torch.einsum("i,j->ij", torch.arange(L, device=device).float(), self.inv_freq.to(device))
+        cos = freqs.cos()[None, None, :, :]   # (1,1,L, half_dim)
+        sin = freqs.sin()[None, None, :, :]   # (1,1,L, half_dim)
+
+        # split even / odd -> shape (..., half_dim)
         q1, q2 = q[..., ::2], q[..., 1::2]
         k1, k2 = k[..., ::2], k[..., 1::2]
-        # apply rotation
-        q_rot = torch.stack([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1).flatten(-2)
-        k_rot = torch.stack([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1).flatten(-2)
+
+        # apply rotation on halves
+        q_rot_even = q1 * cos - q2 * sin
+        q_rot_odd  = q1 * sin + q2 * cos
+        k_rot_even = k1 * cos - k2 * sin
+        k_rot_odd  = k1 * sin + k2 * cos
+
+        # interleave even/odd back to last dim
+        q_rot = torch.stack([q_rot_even, q_rot_odd], dim=-1).flatten(-2)
+        k_rot = torch.stack([k_rot_even, k_rot_odd], dim=-1).flatten(-2)
+
         return q_rot, k_rot
 
     def forward(self, x: torch.Tensor, key_padding_mask=None, causal=False):
