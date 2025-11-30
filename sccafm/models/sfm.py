@@ -149,7 +149,7 @@ class GeneRouter(nn.Module):
         """
         Args:
             x: FloatTensor of shape (C, L, E)
-            gene_subset: BoolTensor (L,), True = selected token, False = unselected
+            gene_subset: BoolTensor (C, L-1), True = selected token, False = unselected
             key_padding_mask: BoolTensor (C, L), True = valid token, False = masked
             temperature: Softmax temperature for logits
 
@@ -158,32 +158,42 @@ class GeneRouter(nn.Module):
                 Assignment probabilities over m factors for selected genes (S)
         """
         if x.dim() != 3:
-            raise ValueError("tokens must be shape (C, L, E)")
-        
-        L = x.shape[1]
-        if gene_subset is None:
-            gene_subset = torch.ones(L, dtype=torch.bool, device=x.device)
-            gene_subset[0] = False
+            raise ValueError("x must be shape (C, L, E)")
 
-        x = x[:, gene_subset, :]  # (C, S, E)
+        C, L, E = x.shape
+        x = x[:, 1:, :]
 
-        if key_padding_mask is not None:
-            key_padding_mask = key_padding_mask[:, gene_subset]
+        # -------------------------------
+        # 1. gene_subset provided
+        # -------------------------------
+        if gene_subset is not None:
+            if gene_subset.dtype != torch.bool or gene_subset.shape != (C, L-1):
+                raise ValueError("gene_subset must be BoolTensor of shape (C, L-1)")
 
-        logits = self.mlp(x) / temperature          # (C, S, m)
+            x = x[gene_subset].view(C, -1, E)     # (C, S, E)
+
+        # -------------------------------
+        # 2. else use key_padding_mask
+        # -------------------------------
+        elif key_padding_mask is not None:
+            if key_padding_mask.dtype != torch.bool or key_padding_mask.shape != (C, L):
+                raise ValueError("key_padding_mask must be BoolTensor (C, L)")
+
+            keep = ~key_padding_mask     # True = keep
+            keep = keep[:, 1:]
+            x = x[keep].view(C, -1, E)   # (C, S, E)
+
+        # --------------------------------------------------
+        # Compute logits → gating → probs
+        # --------------------------------------------------
+        logits = self.mlp(x) / temperature  # (C, S, m)
 
         if self.gating is not None:
-            probs = self.gating(logits)             # (C, S, m)
+            probs = self.gating(logits)
         else:
-            probs = F.softmax(logits, dim=-1)       # (C, S, m)
+            probs = F.softmax(logits, dim=-1)
 
-        # Zero out invalid <pad> tokens
-        if key_padding_mask is not None:
-            mask = ~key_padding_mask
-            mask = mask.unsqueeze(-1)
-            probs = probs * mask.float()
-
-        return probs, key_padding_mask
+        return probs
 
 
 class SFM(nn.Module):
@@ -199,10 +209,13 @@ class SFM(nn.Module):
         num_heads: int = 8,
         num_factors: int = 256,
         topk: int = 32,
+        tf_list: Optional[list] = None,
         **kwargs
     ):
         super().__init__()
         assert (embed_dim % 2) == 0, "embed_dim must be even"
+
+        self.token_dict = token_dict
 
         self.embedding = TomoEmbedding(
             token_dict, 
@@ -231,6 +244,11 @@ class SFM(nn.Module):
             topk=topk
         )
 
+        if tf_list is not None:
+            self.tf_idx = self._tf2id(tf_list)
+        else:
+            self.tf_idx = None
+
         # apply initialization recursively to all submodules
         self.apply(self._init_weights)
 
@@ -240,33 +258,48 @@ class SFM(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
     
-    def get_grn(self, grn, tf_pad, tg_pad):
-        if tf_pad is not None:
-            tf_valid = ~tf_pad[0]
-        else:
-            tf_valid = torch.ones(grn.shape[1], dtype=torch.bool, device=grn.device)
-        
-        if tg_pad is not None:
-            tg_valid = ~tg_pad[0]
-        else:
-            tg_valid = torch.ones(grn.shape[2], dtype=torch.bool, device=grn.device)
+    def _tf2id(self, tf_list):
+        # Determine which dictionary to use
+        use_gene_id = all(name.startswith("ENSG") for name in tf_list)
 
-        return grn[:, tf_valid, :][:, :, tg_valid]
+        symbol2id = dict(zip(self.token_dict["gene_symbol"], self.token_dict["token_index"]))
+        id2id     = dict(zip(self.token_dict["gene_id"],     self.token_dict["token_index"]))
+
+        lookup = id2id if use_gene_id else symbol2id
+
+        # Collect token indices if present
+        tf_idx = [lookup[name] for name in tf_list if name in lookup]
+
+        if len(tf_idx) == 0:
+            raise ValueError("None of the TFs are in token_dict. Please check tf_list!")
+
+        return torch.tensor(tf_idx, dtype=torch.long)
+
+    def _query_gene_subset(self, tokens):
+        gene_tokens = tokens["gene"]
+        self.tf_idx = self.tf_idx.to(gene_tokens.device)
+
+        gene_subset = (gene_tokens.unsqueeze(-1) == self.tf_idx.unsqueeze(0).unsqueeze(0)).any(dim=-1)
+        return gene_subset
 
     def forward(
             self,
             tokens,
-            gene_subset: Optional[torch.Tensor] = None,
             **kwargs
     ):
         x, key_padding_mask = self.embedding(tokens)
         x = self.backbone(x, key_padding_mask, causal=False)
 
-        u, tf_pad = self.tfrouter(x, gene_subset, key_padding_mask, **kwargs)
-        v, tg_pad = self.tgrouter(x, None, key_padding_mask, **kwargs)
+        if self.tf_idx is not None:
+            gene_subset = self._query_gene_subset(tokens)
+        else:
+            gene_subset = None
+
+        u = self.tfrouter(x, gene_subset, key_padding_mask, **kwargs)
+        v = self.tgrouter(x, None, key_padding_mask, **kwargs)
 
         grn = torch.einsum('cfm,cgm->cfg', u, v)
-        return grn, tf_pad, tg_pad
+        return grn
 
 
 
@@ -278,12 +311,13 @@ if __name__ == "__main__":
 
     adata = sc.read_h5ad("/data1021/xukaichen/data/DRP/cell_line.h5ad")
     token_dict = pd.read_csv("./resources/token_dict.csv")
+    tf_dict = pd.read_csv("./resources/human-tfs.csv")
+    tf_list = tf_dict["TF"].tolist()
 
     tokenizer = TomeTokenizer(token_dict, simplify=True)
     tokens = tokenizer(adata[:4, :].copy())
 
-    model = SFM(token_dict)
-    grn, tf_pad, tg_pad = model(tokens)
-    grn = model.get_grn(grn, tf_pad, tg_pad)
+    model = SFM(token_dict, tf_list=tf_list)
+    grn = model(tokens)
 
     print(grn.shape)
