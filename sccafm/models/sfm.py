@@ -320,4 +320,7 @@ if __name__ == "__main__":
     model = SFM(token_dict, tf_list=tf_list)
     grn = model(tokens)
 
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params / 1e6:.2f} M")
+
     print(grn.shape)
