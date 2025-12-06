@@ -305,22 +305,27 @@ class SFM(nn.Module):
 
 
 if __name__ == "__main__":
+    import time
     import scanpy as sc
     import pandas as pd
     from ..tokenizer import TomeTokenizer
 
-    adata = sc.read_h5ad("/data1021/xukaichen/data/DRP/cell_line.h5ad")
+    adata = sc.read_h5ad("/data1021/xukaichen/data/CTA/pbmc.h5ad")
     token_dict = pd.read_csv("./resources/token_dict.csv")
     tf_dict = pd.read_csv("./resources/human-tfs.csv")
     tf_list = tf_dict["TF"].tolist()
 
-    tokenizer = TomeTokenizer(token_dict, simplify=True)
-    tokens = tokenizer(adata[:4, :].copy())
+    Ng = 2000
+    Nc = 10000
+    tokenizer = TomeTokenizer(token_dict, simplify=True, max_length=Ng+1)
+    tokens = tokenizer(adata[:100, :].copy(), n_top_genes=Ng)
 
+    start_time = time.time()
     model = SFM(token_dict, tf_list=tf_list)
     grn = model(tokens)
+    end_time = time.time()
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params / 1e6:.2f} M")
-
-    print(grn.shape)
+    elapsed_time = end_time - start_time
+    fold = Nc/100
+    final_time = elapsed_time*fold
+    print(f"Running time: {final_time:.4f} s")

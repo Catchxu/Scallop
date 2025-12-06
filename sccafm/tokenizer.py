@@ -302,7 +302,7 @@ class TomeTokenizer:
             pad: (C, L-1)
         """
         if preprocess:
-            self._preprocess(adata, **kwargs)
+            adata = self._preprocess(adata, **kwargs)
 
         gene_tokens, gene_pad = self.gene_tokenizer(
             adata,
