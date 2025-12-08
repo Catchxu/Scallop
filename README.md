@@ -8,9 +8,12 @@ scCAFM is a causality-aware foundation model designed for large-scale single-cel
 </div>
 <br/>
 
-At its core, scCAFM couples two synergistic components:
-1. **Structure Foundation Module (SFM)**
-Performs efficient context-specific causal gene regulatory network (GRN) inference using a Mixture-of-Experts mediated latent factorization, enabling scalable estimation of directed cell-specific GRNs.
+## Core concepts
+**Structure Foundation Module (SFM)**
+* Efficient, context-aware causal GRN inference in a latent factor space.
+* Uses a Mixture-of-Experts (MoE) architecture so different latent experts capture distinct regulatory contexts; this enables per-cell GRN specialization without learning a full causal model per cell.
+* Outputs: per-cell directed edges with causal confidence, context assignment, and compact latent summaries.
 
-2. **Embedding Foundation Module (EFM)**
-Learns semantic gene and cell representations whose embedding geometry is explicitly shaped by causal structure inferred via SFM. This yields representations that are biologically meaningful, transferable across datasets, and predictive in downstream applications.
+**Embedding Foundation Module (EFM)**
+* Learns gene and cell embeddings guided by the SFM-inferred causal structure (e.g., contrastive/cause-aware objectives).
+* Embeddings are transferable: they improve downstream supervised and unsupervised tasks (drug sensitivity, perturbation response prediction, trajectory/lineage inference).
