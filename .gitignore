@@ -175,5 +175,4 @@ cython_debug/
 .pypirc
 
 # Project file
-results/
-analysis/
+human-hks.csv
